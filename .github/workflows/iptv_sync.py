@@ -105,6 +105,14 @@ def is_cctv_or_satellite(entry: Entry) -> bool:
     metadata = entry.extinf.split(",", 1)[0]
     title = entry.extinf.split(",", 1)[-1]
     normalized = f"{metadata} {title}".upper().replace("－", "-").replace("—", "-")
+    excluded = re.search(
+        r"CGTN|外语|外語|英语|英語|俄语|俄語|法语|法語|西语|西語|阿语|阿語|"
+        r"德语|德語|日语|日語|韩语|韓語|葡语|葡語|ENGLISH|RUSSIAN|FRENCH|"
+        r"ARABIC|GERMAN|JAPANESE|KOREAN|游戏|遊戲|足球|熊猫直播|熊貓直播|PANDA\s*LIVE",
+        normalized,
+    )
+    if excluded:
+        return False
     cctv = re.search(r"\bCCTV[\s-]?\d", normalized) or re.search(r"\b(?:CGTN|CHC)\b", normalized)
     satellite = "卫视" in normalized or "衛視" in normalized
     groups = re.search(r'group-title\s*=\s*["\']([^"\']+)["\']', metadata, re.IGNORECASE)

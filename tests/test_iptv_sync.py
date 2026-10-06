@@ -47,10 +47,33 @@ https://example.invalid/hunan
 https://example.invalid/local
 #EXTINF:-1 tvg-name="CGTN",国际频道
 https://example.invalid/cgtn
-""")
+        """)
         selected = MODULE.filter_cctv_and_satellite(entries)
         self.assertEqual([entry.extinf.split(",", 1)[-1] for entry in selected],
-                         ["CCTV1", "湖南台", "国际频道"])
+                         ["CCTV1", "湖南台"])
+
+    def test_cctv_satellite_filter_excludes_requested_channels(self):
+        entries = MODULE.parse_m3u("""#EXTM3U
+#EXTINF:-1 group-title="央视频道",CGTN英语
+https://example.invalid/cgtn
+#EXTINF:-1 group-title="央视频道",上海外语
+https://example.invalid/language
+#EXTINF:-1 group-title="央视频道",游戏风云
+https://example.invalid/game
+#EXTINF:-1 group-title="央视频道",魅力足球
+https://example.invalid/football
+#EXTINF:-1 group-title="央视频道",熊猫直播
+https://example.invalid/panda
+#EXTINF:-1 group-title="央视频道",CCTV4 中文国际
+https://example.invalid/cctv4
+#EXTINF:-1 group-title="卫视频道",湖南卫视
+https://example.invalid/hunan
+""")
+        selected = MODULE.filter_cctv_and_satellite(entries)
+        self.assertEqual(
+            [entry.extinf.split(",", 1)[-1] for entry in selected],
+            ["CCTV4 中文国际", "湖南卫视"],
+        )
 
     def test_invalid_playlist_is_rejected(self):
         for text in (
