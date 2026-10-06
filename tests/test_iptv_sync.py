@@ -127,9 +127,26 @@ https://example.invalid/hunan
             self.assertEqual(command.call_args.kwargs["errors"], "replace")
 
     def test_successful_exit_without_frames_is_rejected(self):
-        result = subprocess.CompletedProcess([], 0, "frame=0\nout_time_us=3000000\nprogress=end\n", "")
+        result = subprocess.CompletedProcess([], 0, "#tb 0: 1/10\n", "")
         with patch.object(MODULE.subprocess, "run", return_value=result):
             self.assertEqual(MODULE.run_ffmpeg("https://example.invalid", 1), (False, "insufficient decoded media"))
+
+    def test_decoded_duration_includes_final_frame_and_rejects_bad_progress(self):
+        frames = "".join(f"0, {i}, {i}, 1, 6144, 0x12345678\n" for i in range(30))
+        for output, expected in (
+            ("#tb 0: 1/10\n" + frames, (True, "ok")),
+            ("#tb 0: 1/10\n" + frames.splitlines()[0] + "\n",
+             (False, "insufficient decoded media")),
+            ("#tb 0: 1/0\n" + frames, (False, "invalid decode progress")),
+            ("#tb 0: 1/10\n0, 0, 0, 30, 0, 0x00000000\n",
+             (False, "invalid decode progress")),
+            ("#tb 0: 1/10\n0, 0\n", (False, "invalid decode progress")),
+        ):
+            with self.subTest(output=output), patch.object(
+                MODULE.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, output, ""),
+            ):
+                self.assertEqual(MODULE.run_ffmpeg("https://example.invalid", 10), expected)
 
     def test_interrupted_validation_keeps_previous_playlist(self):
         entry = MODULE.Entry("#EXTINF:-1,TV", "https://example.invalid/live")

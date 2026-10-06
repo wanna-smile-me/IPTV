@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -165,10 +167,8 @@ def run_ffmpeg(url: str, timeout: int, ffmpeg: str = "ffmpeg", radio: bool = Fal
         "-vn" if radio else "-an",
         "-threads",
         "1",
-        "-progress",
-        "pipe:1",
         "-f",
-        "null",
+        "framecrc",
         "-",
     ]
     try:
@@ -187,13 +187,25 @@ def run_ffmpeg(url: str, timeout: int, ffmpeg: str = "ffmpeg", radio: bool = Fal
         raise SyncError("could not start ffmpeg") from None
     if completed.returncode != 0:
         return False, failure_reason(completed.stderr or "")
-    progress = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+    time_base = None
+    decoded_ticks = 0
     try:
-        duration = int(progress.get("out_time_us", "0"))
-        frames = int(progress.get("frame", "0"))
-    except ValueError:
+        # framecrc includes the final frame's duration, unlike FFmpeg 6.1's
+        # null-muxer progress timestamp, which stops at its starting DTS.
+        for line in completed.stdout.splitlines():
+            if line.startswith("#tb 0:"):
+                time_base = Fraction(line.split(":", 1)[1].strip())
+            elif line.strip() and not line.startswith("#"):
+                fields = next(csv.reader([line]))
+                if len(fields) < 6 or int(fields[0]) != 0:
+                    return False, "invalid decode progress"
+                duration, size = int(fields[3]), int(fields[4])
+                if duration <= 0 or size <= 0:
+                    return False, "invalid decode progress"
+                decoded_ticks += duration
+    except (ValueError, ZeroDivisionError, csv.Error):
         return False, "invalid decode progress"
-    if progress.get("progress") != "end" or duration < 3_000_000 or (not radio and frames <= 0):
+    if time_base is None or time_base <= 0 or decoded_ticks * time_base < 3:
         return False, "insufficient decoded media"
     return True, "ok"
 
