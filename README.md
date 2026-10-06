@@ -26,7 +26,8 @@
    不公开完整播放地址或鉴权信息。
 3. 手动运行并勾选 Publish，确认 `IPTV.m3u` 更新及原订阅链接可用。
 4. 在仓库 Settings → Secrets and variables → Actions → Variables 中新增
-   `IPTV_SYNC_ENABLED`，值为 `true`，开启每 6 小时的定时同步。
+   `IPTV_SYNC_ENABLED`，值为 `true`，开启每天北京时间
+   06:00、12:00、16:00、20:00 的定时同步。
    删除该变量或改为 `false` 可暂停定时任务。
 
 只有列表内容变化才自动提交。GitHub 云端的检测结果不保证家庭网络效果，
