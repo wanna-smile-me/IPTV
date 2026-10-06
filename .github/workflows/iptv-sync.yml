@@ -1,0 +1,92 @@
+name: IPTV sync
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish validated playlist (leave off for first validation)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: iptv-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.event_name == 'workflow_dispatch' || vars.IPTV_SYNC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
+
+      - name: Sync and validate
+        id: sync
+        shell: bash
+        env:
+          PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -o pipefail
+          flags=()
+          if [ "$PUBLISH" != "true" ]; then flags+=(--dry-run); fi
+          python .github/workflows/iptv_sync.py "${flags[@]}" | tee sync-report.json
+
+      - name: Publish report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## IPTV sync report"
+            echo '```json'
+            python - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("sync-report.json")
+          report = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"updated": False, "blocked": "No report generated"}
+          report.pop("failures", None)
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          PY
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save full report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iptv-sync-report
+          path: sync-report.json
+          retention-days: 7
+
+      - name: Commit updated playlist
+        if: success()
+        shell: bash
+        run: |
+          if git diff --quiet -- IPTV.m3u ywIPTV.m3u; then
+            echo "Playlist unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add IPTV.m3u ywIPTV.m3u
+          git commit -m "chore: update IPTV playlist"
+          git push
