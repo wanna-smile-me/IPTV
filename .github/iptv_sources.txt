@@ -1,3 +1,5 @@
 # One M3U/M3U8 source URL per line.
+# Primary source first; subsequent sources supplement the merged playlist.
+https://raw.githubusercontent.com/best-fan/iptv-sources/main/cn_all.m3u8
 https://raw.githubusercontent.com/zilong7728/Collect-IPTV/refs/heads/main/best_sorted.m3u
 https://raw.githubusercontent.com/mzky/checklist/refs/heads/master/itvlist.m3u
