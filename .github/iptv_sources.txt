@@ -1,2 +1,3 @@
 # One M3U/M3U8 source URL per line.
 https://raw.githubusercontent.com/zilong7728/Collect-IPTV/refs/heads/main/best_sorted.m3u
+https://raw.githubusercontent.com/mzky/checklist/refs/heads/master/itvlist.m3u
