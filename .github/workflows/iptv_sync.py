@@ -126,6 +126,17 @@ def filter_cctv_and_satellite(entries: list[Entry]) -> list[Entry]:
     return [entry for entry in entries if is_cctv_or_satellite(entry)]
 
 
+def normalize_yw_group(entry: Entry) -> Entry:
+    metadata, title = entry.extinf.split(",", 1)
+    group = "央视" if re.search(r"\bCCTV[\s-]?\d", f"{metadata} {title}", re.IGNORECASE) else "卫视"
+    group_attr = re.compile(r'group-title\s*=\s*["\'][^"\']*["\']', re.IGNORECASE)
+    if group_attr.search(metadata):
+        metadata = group_attr.sub(f'group-title="{group}"', metadata, count=1)
+    else:
+        metadata = f'{metadata} group-title="{group}"'
+    return Entry(f"{metadata},{title}", entry.url)
+
+
 def failure_reason(stderr: str) -> str:
     text = stderr.lower()
     for tokens, reason in [
@@ -303,7 +314,7 @@ def run(args: argparse.Namespace) -> dict:
     valid, failed = check_entries(unique_entries, args.timeout, args.workers, args.retries)
     old_count = existing_count(args.output)
     yw_output = getattr(args, "yw_output", args.output.with_name("ywIPTV.m3u"))
-    yw_entries = filter_cctv_and_satellite(valid)
+    yw_entries = [normalize_yw_group(entry) for entry in filter_cctv_and_satellite(valid)]
     report = {
         "sources": source_stats,
         "input_entries": len(all_entries),

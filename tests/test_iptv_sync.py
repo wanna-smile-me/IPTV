@@ -75,6 +75,22 @@ https://example.invalid/hunan
             ["CCTV4 中文国际", "湖南卫视"],
         )
 
+    def test_yw_groups_are_normalized(self):
+        entries = MODULE.parse_m3u("""#EXTM3U
+#EXTINF:-1 group-title="卡通频道",CCTV14
+https://example.invalid/cctv14
+#EXTINF:-1 group-title="General",湖南卫视
+https://example.invalid/hunan
+""")
+        normalized = [
+            MODULE.normalize_yw_group(entry)
+            for entry in MODULE.filter_cctv_and_satellite(entries)
+        ]
+        self.assertIn('group-title="央视"', normalized[0].extinf)
+        self.assertIn('group-title="卫视"', normalized[1].extinf)
+        self.assertNotIn("卡通频道", normalized[0].extinf)
+        self.assertNotIn("General", normalized[1].extinf)
+
     def test_invalid_playlist_is_rejected(self):
         for text in (
             "#EXTM3U\nhttps://example.invalid/live.m3u8\n",
