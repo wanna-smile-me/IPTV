@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SOURCES = ROOT / ".github" / "iptv_sources.txt"
+DEFAULT_BLOCKED_HOSTS = ROOT / ".github" / "iptv_blocked_hosts.txt"
 DEFAULT_OUTPUT = ROOT / "IPTV.m3u"
 DEFAULT_YW_OUTPUT = ROOT / "ywIPTV.m3u"
 
@@ -45,6 +46,16 @@ def load_sources(path: Path) -> list[str]:
     if any(not url.startswith(("http://", "https://")) for url in sources):
         raise SyncError("source list contains a non-HTTP URL")
     return sources
+
+
+def load_blocked_hosts(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {
+        line.strip().lower()
+        for line in path.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
 
 
 def fetch(url: str, timeout: int) -> str:
@@ -97,6 +108,18 @@ def deduplicate(entries: list[Entry]) -> list[Entry]:
             seen.add(key)
             result.append(entry)
     return result
+
+
+def filter_blocked_hosts(entries: list[Entry], blocked_hosts: set[str]) -> tuple[list[Entry], int]:
+    kept = []
+    blocked = 0
+    for entry in entries:
+        host = (urlparse(entry.url).hostname or "").lower()
+        if host in blocked_hosts:
+            blocked += 1
+        else:
+            kept.append(entry)
+    return kept, blocked
 
 
 def is_radio(entry: Entry) -> bool:
@@ -300,6 +323,7 @@ def run(args: argparse.Namespace) -> dict:
     if shutil.which("ffmpeg") is None:
         raise SyncError("ffmpeg is not installed")
     sources = load_sources(args.sources)
+    blocked_hosts = load_blocked_hosts(getattr(args, "blocked_hosts", DEFAULT_BLOCKED_HOSTS))
     source_stats = []
     all_entries: list[Entry] = []
     for source in sources:
@@ -310,6 +334,7 @@ def run(args: argparse.Namespace) -> dict:
         source_stats.append({"host": urlparse(source).hostname or "unknown", "entries": len(entries)})
         all_entries.extend(entries)
 
+    all_entries, blocked_entries = filter_blocked_hosts(all_entries, blocked_hosts)
     unique_entries = deduplicate(all_entries)
     valid, failed = check_entries(unique_entries, args.timeout, args.workers, args.retries)
     old_count = existing_count(args.output)
@@ -323,6 +348,7 @@ def run(args: argparse.Namespace) -> dict:
         "yw_entries": len(yw_entries),
         "failed_entries": len(failed),
         "duplicate_entries": len(all_entries) - len(unique_entries),
+        "blocked_host_entries": blocked_entries,
         "failures": failed,
         "previous_entries": old_count,
         "updated": False,

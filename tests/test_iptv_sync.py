@@ -37,6 +37,17 @@ https://backup.example/live.m3u8
         self.assertIn("央视一套", entries[0].extinf)
         self.assertEqual(entries[1].url, "https://backup.example/live.m3u8")
 
+    def test_blocked_hosts_are_removed_before_validation(self):
+        entries = MODULE.parse_m3u("""#EXTM3U
+#EXTINF:-1,Blocked
+http://173.208.212.130:8181/live.m3u8
+#EXTINF:-1,Allowed
+http://example.test/live.m3u8
+""")
+        kept, blocked = MODULE.filter_blocked_hosts(entries, {"173.208.212.130"})
+        self.assertEqual(blocked, 1)
+        self.assertEqual([entry.extinf.split(",", 1)[1] for entry in kept], ["Allowed"])
+
     def test_cctv_and_satellite_filter(self):
         entries = MODULE.parse_m3u("""#EXTM3U
 #EXTINF:-1 group-title="央视频道",CCTV1
