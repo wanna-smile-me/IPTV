@@ -8,13 +8,15 @@ import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
@@ -173,16 +175,26 @@ def build_yw_entries(
     return entries, annotations, missing
 
 
+def redact_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+    query = urlencode(
+        [(key, "[REDACTED]") for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+    )
+    return parsed._replace(query=query or "[REDACTED]", fragment="").geturl()
+
+
 def render_host_review(entries: list[tuple[int, str, Entry]], blocked_urls: set[str]) -> str:
     lines = ["#EXTM3U", "# Review only: not a subscription playlist."]
     for source_number, source, entry in entries:
         status = "temporarily blocked exact URL" if entry.url in blocked_urls else "not blocked"
         lines.extend(
             (
-                f"# Review-Source: {source_number} {source}",
+                f"# Review-Source: {source_number} {redact_url(source)}",
                 f"# Review-Status: {status}",
                 entry.extinf,
-                entry.url,
+                redact_url(entry.url),
             )
         )
     return "\n".join(lines) + "\n"
@@ -310,6 +322,40 @@ def run_ffmpeg(url: str, timeout: int, ffmpeg: str = "ffmpeg", radio: bool = Fal
     return True, "ok"
 
 
+def quick_probe(url: str, timeout: int) -> tuple[bool, str]:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "iptv-sync/1.0",
+            "Range": "bytes=0-4095",
+        },
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            status = getattr(response, "status", 200)
+            if status not in (200, 206):
+                return False, f"probe HTTP {status}"
+            if response.headers.get_content_type() == "text/html":
+                return False, "probe html response"
+            payload = response.read(4096)
+    except HTTPError as exc:
+        return False, f"probe HTTP {exc.code}"
+    except (TimeoutError, socket.timeout):
+        return False, "probe timeout"
+    except URLError:
+        return False, "probe network error"
+    except ValueError:
+        return False, "probe invalid URL"
+    except OSError:
+        return False, "probe network error"
+    if not payload:
+        return False, "probe empty response"
+    sample = payload.lstrip().lower()
+    if sample.startswith((b"<!doctype html", b"<html", b"<head")):
+        return False, "probe html response"
+    return True, "ok"
+
+
 def check_entry(entry: Entry, timeout: int, retries: int) -> tuple[bool, str]:
     last_reason = "not checked"
     for attempt in range(retries + 1):
@@ -322,10 +368,47 @@ def check_entry(entry: Entry, timeout: int, retries: int) -> tuple[bool, str]:
     return False, last_reason
 
 
-def check_entries(entries: list[Entry], timeout: int, workers: int, retries: int) -> tuple[list[Entry], list[dict[str, str]]]:
+def quick_probe_entries(
+    entries: list[Entry],
+    timeout: int,
+    workers: int,
+    order: dict[Entry, int] | None = None,
+) -> tuple[list[Entry], list[dict[str, str]]]:
+    order = order or {entry: index for index, entry in enumerate(entries)}
+    candidates: list[Entry] = []
+    failed: list[dict[str, str]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(quick_probe, entry.url, timeout): entry for entry in entries}
+        for future in concurrent.futures.as_completed(futures):
+            entry = futures[future]
+            try:
+                ok, reason = future.result()
+            except Exception:
+                raise SyncError("quick probe did not complete") from None
+            if ok:
+                candidates.append(entry)
+            else:
+                failed.append(
+                    {
+                        "entry": str(order[entry] + 1),
+                        "reason": reason,
+                    }
+                )
+    candidates.sort(key=order.__getitem__)
+    failed.sort(key=lambda item: int(item["entry"]))
+    return candidates, failed
+
+
+def check_entries(
+    entries: list[Entry],
+    timeout: int,
+    workers: int,
+    retries: int,
+    order: dict[Entry, int] | None = None,
+) -> tuple[list[Entry], list[dict[str, str]]]:
     valid: list[Entry] = []
     failed: list[dict[str, str]] = []
-    order = {entry: index for index, entry in enumerate(entries)}
+    order = order or {entry: index for index, entry in enumerate(entries)}
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(check_entry, entry, timeout, retries): entry for entry in entries}
         for future in concurrent.futures.as_completed(futures):
@@ -434,7 +517,14 @@ def run(args: argparse.Namespace) -> dict:
             all_entries.extend(eligible)
 
     unique_entries = deduplicate(all_entries)
-    valid, failed = check_entries(unique_entries, args.timeout, args.workers, args.retries)
+    entry_order = {entry: index for index, entry in enumerate(unique_entries)}
+    probe_candidates, probe_failed = quick_probe_entries(
+        unique_entries, getattr(args, "probe_timeout", 4), args.workers, entry_order
+    )
+    valid, decode_failed = check_entries(
+        probe_candidates, args.timeout, args.workers, args.retries, entry_order
+    )
+    failed = sorted(probe_failed + decode_failed, key=lambda item: int(item["entry"]))
     old_count = existing_count(args.output)
     yw_output = getattr(args, "yw_output", args.output.with_name("ywIPTV.m3u"))
     previous_yw = parse_m3u(yw_output.read_text(encoding="utf-8-sig")) if yw_output.exists() else []
@@ -449,6 +539,9 @@ def run(args: argparse.Namespace) -> dict:
         "eligible_entries": len(all_entries),
         "deduplicated_entries": len(unique_entries),
         "valid_entries": len(valid),
+        "quick_probe_candidates": len(probe_candidates),
+        "quick_probe_failed_entries": len(probe_failed),
+        "full_decode_entries": len(probe_candidates),
         "yw_entries": len(yw_entries),
         "failed_entries": len(failed),
         "duplicate_entries": len(all_entries) - len(unique_entries),
@@ -502,12 +595,13 @@ def main() -> int:
     parser.add_argument("--yw-output", type=Path, default=DEFAULT_YW_OUTPUT)
     parser.add_argument("--review-output", type=Path, default=DEFAULT_REVIEW_OUTPUT)
     parser.add_argument("--download-timeout", type=int, default=20)
+    parser.add_argument("--probe-timeout", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=20)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true", help="Validate all streams without writing the playlist.")
     args = parser.parse_args()
-    if min(args.download_timeout, args.timeout, args.workers) < 1 or args.retries < 0:
+    if min(args.download_timeout, args.probe_timeout, args.timeout, args.workers) < 1 or args.retries < 0:
         parser.error("timeouts/workers must be positive and retries must be nonnegative")
     try:
         report = run(args)

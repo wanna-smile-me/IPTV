@@ -166,6 +166,37 @@ https://example.invalid/hunan
             self.assertEqual(MODULE.check_entry(entry, timeout=1, retries=1), (True, "ok"))
             self.assertEqual(check.call_count, 2)
 
+    def test_quick_probe_rejects_html_and_accepts_stream_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "page").write_text("<html>advertisement</html>", encoding="utf-8")
+            (root / "stream").write_bytes(b"#EXTM3U\n#EXTINF:-1,Test\n")
+            handler = functools.partial(QuietHandler, directory=root)
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                self.assertEqual(MODULE.quick_probe(base + "/page", 2), (False, "probe html response"))
+                self.assertEqual(MODULE.quick_probe(base + "/stream", 2), (True, "ok"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+    def test_host_review_redacts_query_values(self):
+        entry = MODULE.Entry(
+            '#EXTINF:-1,带鉴权线路',
+            'https://stream.example/live.m3u8?auth_key=secret&quality=hd',
+        )
+        review = MODULE.render_host_review(
+            [(1, "https://source.example/list.m3u8?token=source-secret", entry)],
+            set(),
+        )
+        self.assertNotIn("secret", review)
+        self.assertIn("auth_key=%5BREDACTED%5D", review)
+        self.assertIn("quality=%5BREDACTED%5D", review)
+
     def test_retry_failure_is_not_permanently_blacklisted(self):
         entry = MODULE.Entry("#EXTINF:-1,TV", "https://example.invalid/live")
         with patch.object(MODULE, "run_ffmpeg", return_value=(False, "timeout")) as check:
@@ -239,6 +270,7 @@ https://example.invalid/hunan
             )
             output.write_text(old, encoding="utf-8")
             args = argparse.Namespace(sources=sources, output=output, download_timeout=1, timeout=1,
+                                      probe_timeout=1,
                                       yw_output=Path(directory) / "ywIPTV.m3u",
                                       workers=1, retries=0, dry_run=False)
             with patch.object(MODULE.shutil, "which", return_value="ffmpeg"):
@@ -246,17 +278,83 @@ https://example.invalid/hunan
                     with self.assertRaisesRegex(MODULE.SyncError, "source 1 download or format validation failed"):
                         MODULE.run(args)
                 with patch.object(MODULE, "fetch", return_value=old):
-                    with patch.object(MODULE, "check_entries", return_value=([], [{"entry": "1", "reason": "timeout"}])):
+                    with patch.object(
+                        MODULE,
+                        "quick_probe_entries",
+                        return_value=(MODULE.parse_m3u(old), []),
+                    ), patch.object(
+                        MODULE,
+                        "check_entries",
+                        return_value=([], [{"entry": "1", "reason": "timeout"}]),
+                    ):
                         report = MODULE.run(args)
                         self.assertIn("playlist_blocked", report)
                         self.assertEqual(report["valid_entries"], 0)
-                    with patch.object(MODULE, "check_entries", side_effect=MODULE.SyncError("validation did not complete")):
+                    with patch.object(
+                        MODULE,
+                        "quick_probe_entries",
+                        return_value=(MODULE.parse_m3u(old), []),
+                    ), patch.object(
+                        MODULE,
+                        "check_entries",
+                        side_effect=MODULE.SyncError("validation did not complete"),
+                    ):
                         with self.assertRaises(MODULE.SyncError):
                             MODULE.run(args)
                     args.dry_run = True
-                    with patch.object(MODULE, "check_entries", return_value=(MODULE.parse_m3u(old), [])):
+                    with patch.object(
+                        MODULE,
+                        "quick_probe_entries",
+                        return_value=(MODULE.parse_m3u(old), []),
+                    ), patch.object(
+                        MODULE,
+                        "check_entries",
+                        return_value=(MODULE.parse_m3u(old), []),
+                    ):
                         self.assertTrue(MODULE.run(args)["would_update"])
                 self.assertEqual(output.read_text(encoding="utf-8"), old)
+
+    def test_playlist_guard_does_not_block_yw_fallback_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "IPTV.m3u"
+            yw_output = Path(directory) / "ywIPTV.m3u"
+            sources = Path(directory) / "sources.txt"
+            blocked_urls = Path(directory) / "blocked.txt"
+            sources.write_text("https://example.invalid/source\n", encoding="utf-8")
+            blocked_urls.write_text("", encoding="utf-8")
+            source_text = "#EXTM3U\n" + "".join(
+                f'#EXTINF:-1 group-title="央视",CCTV-{number}\n'
+                f"https://example.invalid/cctv{number}.m3u8\n"
+                for number in range(1, 16)
+            )
+            args = argparse.Namespace(
+                sources=sources,
+                blocked_urls=blocked_urls,
+                output=output,
+                yw_output=yw_output,
+                review_output=Path(directory) / "review.m3u",
+                download_timeout=1,
+                probe_timeout=1,
+                timeout=1,
+                workers=1,
+                retries=0,
+                dry_run=False,
+            )
+            with patch.object(MODULE.shutil, "which", return_value="ffmpeg"), \
+                 patch.object(MODULE, "fetch", return_value=source_text), \
+                 patch.object(MODULE, "quick_probe_entries", return_value=(MODULE.parse_m3u(source_text), [])), \
+                 patch.object(MODULE, "check_entries", return_value=([], [])):
+                report = MODULE.run(args)
+            self.assertIn("playlist_blocked", report)
+            self.assertTrue(report["yw_updated"])
+            self.assertTrue(yw_output.exists())
+            self.assertEqual(
+                {
+                    MODULE.cctv_channel_number(entry)
+                    for entry in MODULE.parse_m3u(yw_output.read_text(encoding="utf-8"))
+                },
+                set(range(1, 16)),
+            )
 
     def test_multiple_sources_and_publish_only_on_change(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -269,9 +367,11 @@ https://example.invalid/hunan
                 for number in range(1, 16)
             )
             args = argparse.Namespace(sources=sources, output=output, download_timeout=1, timeout=1,
+                                      probe_timeout=1,
                                       workers=1, retries=0, dry_run=False)
             with patch.object(MODULE.shutil, "which", return_value="ffmpeg"), \
                  patch.object(MODULE, "fetch", return_value=text), \
+                 patch.object(MODULE, "quick_probe_entries", return_value=(MODULE.parse_m3u(text), [])), \
                  patch.object(MODULE, "check_entry", return_value=(True, "ok")):
                 report = MODULE.run(args)
                 self.assertEqual(report["duplicate_entries"], 15)
