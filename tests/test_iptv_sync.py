@@ -48,6 +48,24 @@ http://example.test/live.m3u8
         self.assertEqual(blocked, 1)
         self.assertEqual([entry.extinf.split(",", 1)[1] for entry in kept], ["Allowed"])
 
+    def test_render_removes_quality_suffix_and_keeps_comment_annotation(self):
+        entries = [
+            MODULE.Entry(
+                '#EXTINF:-1 group-title="央视",CCTV-1 (720p)',
+                "https://example.test/cctv1.m3u8",
+            ),
+            MODULE.Entry(
+                '#EXTINF:-1 group-title="央视",CCTV-6',
+                "https://example.test/cctv6.m3u8",
+            ),
+        ]
+        rendered = MODULE.render(entries)
+        self.assertIn("# Original-Name: CCTV-1 (720p)", rendered)
+        self.assertIn('group-title="央视",CCTV-1\n', rendered)
+        self.assertNotIn("group-title=\"央视\",CCTV-1 (720p)", rendered)
+        self.assertIn('group-title="央视",CCTV-6\n', rendered)
+        self.assertEqual(len(MODULE.parse_m3u(rendered)), 2)
+
     def test_cctv_and_satellite_filter(self):
         entries = MODULE.parse_m3u("""#EXTM3U
 #EXTINF:-1 group-title="央视频道",CCTV1

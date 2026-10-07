@@ -282,10 +282,22 @@ def check_entries(entries: list[Entry], timeout: int, workers: int, retries: int
     return valid, failed
 
 
+QUALITY_SUFFIX = re.compile(r"\s*\((?:\d{3,4}p|\d{3,4}i|SD|HD)\)\s*$", re.IGNORECASE)
+
+
+def display_entry(entry: Entry) -> tuple[str, str | None]:
+    metadata, title = entry.extinf.split(",", 1)
+    display_title = QUALITY_SUFFIX.sub("", title).rstrip()
+    return f"{metadata},{display_title}", (title if display_title != title else None)
+
+
 def render(entries: list[Entry]) -> str:
     lines = ["#EXTM3U", f"# Channel-Count: {len(entries)}"]
     for entry in entries:
-        lines.extend((entry.extinf, entry.url))
+        extinf, original_title = display_entry(entry)
+        if original_title is not None:
+            lines.append(f"# Original-Name: {original_title}")
+        lines.extend((extinf, entry.url))
     return "\n".join(lines) + "\n"
 
 
