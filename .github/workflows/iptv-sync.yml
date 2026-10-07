@@ -75,7 +75,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: iptv-sync-report
-          path: sync-report.json
+          path: |
+            sync-report.json
+            host-review.m3u
           retention-days: 7
 
       - name: Commit updated playlist

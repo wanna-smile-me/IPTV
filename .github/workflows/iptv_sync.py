@@ -20,9 +20,10 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SOURCES = ROOT / ".github" / "iptv_sources.txt"
-DEFAULT_BLOCKED_HOSTS = ROOT / ".github" / "iptv_blocked_hosts.txt"
+DEFAULT_BLOCKED_URLS = ROOT / ".github" / "iptv_blocked_urls.txt"
 DEFAULT_OUTPUT = ROOT / "IPTV.m3u"
 DEFAULT_YW_OUTPUT = ROOT / "ywIPTV.m3u"
+DEFAULT_REVIEW_OUTPUT = ROOT / "host-review.m3u"
 
 
 class SyncError(RuntimeError):
@@ -48,11 +49,11 @@ def load_sources(path: Path) -> list[str]:
     return sources
 
 
-def load_blocked_hosts(path: Path) -> set[str]:
+def load_blocked_urls(path: Path) -> set[str]:
     if not path.exists():
         return set()
     return {
-        line.strip().lower()
+        line.strip()
         for line in path.read_text(encoding="utf-8-sig").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     }
@@ -110,16 +111,81 @@ def deduplicate(entries: list[Entry]) -> list[Entry]:
     return result
 
 
-def filter_blocked_hosts(entries: list[Entry], blocked_hosts: set[str]) -> tuple[list[Entry], int]:
-    kept = []
-    blocked = 0
-    for entry in entries:
-        host = (urlparse(entry.url).hostname or "").lower()
-        if host in blocked_hosts:
-            blocked += 1
-        else:
-            kept.append(entry)
-    return kept, blocked
+def filter_blocked_urls(entries: list[Entry], blocked_urls: set[str]) -> tuple[list[Entry], int]:
+    kept = [entry for entry in entries if entry.url not in blocked_urls]
+    return kept, len(entries) - len(kept)
+
+
+def cctv_channel_number(entry: Entry) -> int | None:
+    metadata, title = entry.extinf.split(",", 1)
+    match = re.search(
+        r"\bCCTV[\s-]*0*(\d{1,2})(?!\d)(?!\s*\+)",
+        f"{metadata} {title}".upper().replace("－", "-").replace("—", "-"),
+    )
+    if not match:
+        return None
+    number = int(match.group(1))
+    return number if 1 <= number <= 15 else None
+
+
+def build_yw_entries(
+    valid: list[Entry],
+    candidates: list[Entry],
+    previous: list[Entry],
+    blocked_urls: set[str],
+) -> tuple[list[Entry], dict[str, str], list[str]]:
+    valid_yw = filter_cctv_and_satellite(valid)
+    entries = [normalize_yw_group(entry) for entry in valid_yw]
+    present = {cctv_channel_number(entry) for entry in valid_yw}
+    annotations: dict[str, str] = {}
+    missing: list[str] = []
+
+    for number in range(1, 16):
+        if number in present:
+            continue
+        fallback = next(
+            (
+                entry
+                for entry in previous
+                if cctv_channel_number(entry) == number
+                and entry.url not in blocked_urls
+                and is_cctv_or_satellite(entry)
+            ),
+            None,
+        )
+        if fallback is None:
+            fallback = next(
+                (
+                    entry
+                    for entry in candidates
+                    if cctv_channel_number(entry) == number
+                    and is_cctv_or_satellite(entry)
+                ),
+                None,
+            )
+        if fallback is None:
+            missing.append(f"CCTV-{number}")
+            continue
+        normalized = normalize_yw_group(fallback)
+        entries.append(normalized)
+        annotations[normalized.url] = "unverified fallback; no current candidate passed validation"
+
+    return entries, annotations, missing
+
+
+def render_host_review(entries: list[tuple[int, str, Entry]], blocked_urls: set[str]) -> str:
+    lines = ["#EXTM3U", "# Review only: not a subscription playlist."]
+    for source_number, source, entry in entries:
+        status = "temporarily blocked exact URL" if entry.url in blocked_urls else "not blocked"
+        lines.extend(
+            (
+                f"# Review-Source: {source_number} {source}",
+                f"# Review-Status: {status}",
+                entry.extinf,
+                entry.url,
+            )
+        )
+    return "\n".join(lines) + "\n"
 
 
 def is_radio(entry: Entry) -> bool:
@@ -292,11 +358,17 @@ def display_entry(entry: Entry) -> tuple[str, str | None]:
 
 
 def render(entries: list[Entry]) -> str:
+    return render_with_annotations(entries, {})
+
+
+def render_with_annotations(entries: list[Entry], annotations: dict[str, str]) -> str:
     lines = ["#EXTM3U", f"# Channel-Count: {len(entries)}"]
     for entry in entries:
         extinf, original_title = display_entry(entry)
         if original_title is not None:
             lines.append(f"# Original-Name: {original_title}")
+        if entry.url in annotations:
+            lines.append(f"# Stream-Status: {annotations[entry.url]}")
         lines.extend((extinf, entry.url))
     return "\n".join(lines) + "\n"
 
@@ -335,32 +407,55 @@ def run(args: argparse.Namespace) -> dict:
     if shutil.which("ffmpeg") is None:
         raise SyncError("ffmpeg is not installed")
     sources = load_sources(args.sources)
-    blocked_hosts = load_blocked_hosts(getattr(args, "blocked_hosts", DEFAULT_BLOCKED_HOSTS))
+    blocked_urls = load_blocked_urls(getattr(args, "blocked_urls", DEFAULT_BLOCKED_URLS))
+    review_hosts = {
+        parsed.hostname.lower()
+        for url in blocked_urls
+        if (parsed := urlparse(url)).hostname
+    }
     source_stats = []
     all_entries: list[Entry] = []
-    for source in sources:
+    review_entries: list[tuple[int, str, Entry]] = []
+    blocked_entries = 0
+    input_count = 0
+    for source_number, source in enumerate(sources, 1):
         try:
             entries = parse_m3u(fetch(source, args.download_timeout))
         except Exception:
             raise SyncError(f"source {len(source_stats) + 1} download or format validation failed") from None
         source_stats.append({"host": urlparse(source).hostname or "unknown", "entries": len(entries)})
-        all_entries.extend(entries)
+        input_count += len(entries)
+        for entry in entries:
+            host = (urlparse(entry.url).hostname or "").lower()
+            if host in review_hosts:
+                review_entries.append((source_number, source, entry))
+            eligible, blocked = filter_blocked_urls([entry], blocked_urls)
+            blocked_entries += blocked
+            all_entries.extend(eligible)
 
-    all_entries, blocked_entries = filter_blocked_hosts(all_entries, blocked_hosts)
     unique_entries = deduplicate(all_entries)
     valid, failed = check_entries(unique_entries, args.timeout, args.workers, args.retries)
     old_count = existing_count(args.output)
     yw_output = getattr(args, "yw_output", args.output.with_name("ywIPTV.m3u"))
-    yw_entries = [normalize_yw_group(entry) for entry in filter_cctv_and_satellite(valid)]
+    previous_yw = parse_m3u(yw_output.read_text(encoding="utf-8-sig")) if yw_output.exists() else []
+    yw_entries, yw_annotations, missing_cctv = build_yw_entries(
+        valid, unique_entries, previous_yw, blocked_urls
+    )
+    review_output = getattr(args, "review_output", args.output.with_name("host-review.m3u"))
+    write_if_changed(review_output, render_host_review(review_entries, blocked_urls))
     report = {
         "sources": source_stats,
-        "input_entries": len(all_entries),
+        "input_entries": input_count,
+        "eligible_entries": len(all_entries),
         "deduplicated_entries": len(unique_entries),
         "valid_entries": len(valid),
         "yw_entries": len(yw_entries),
         "failed_entries": len(failed),
         "duplicate_entries": len(all_entries) - len(unique_entries),
-        "blocked_host_entries": blocked_entries,
+        "temporarily_blocked_entries": blocked_entries,
+        "host_review_entries": len(review_entries),
+        "yw_unverified_fallback_entries": len(yw_annotations),
+        "missing_cctv_channels": missing_cctv,
         "failures": failed,
         "previous_entries": old_count,
         "updated": False,
@@ -369,29 +464,43 @@ def run(args: argparse.Namespace) -> dict:
     try:
         ensure_safe_to_publish(len(unique_entries), len(valid), old_count)
     except SyncError as exc:
-        report["blocked"] = str(exc)
-        return report
+        report["playlist_blocked"] = str(exc)
     if not yw_entries:
-        report["blocked"] = "no CCTV or satellite channels passed validation"
+        report["blocked"] = "no CCTV or satellite channels available for ywIPTV"
+        return report
+    if missing_cctv:
+        report["blocked"] = f"required CCTV channels unavailable: {', '.join(missing_cctv)}"
         return report
     if args.dry_run:
         report["would_update"] = (
-            not args.output.exists() or args.output.read_text(encoding="utf-8-sig") != render(valid)
+            "playlist_blocked" not in report
+            and (
+                not args.output.exists()
+                or args.output.read_text(encoding="utf-8-sig") != render(valid)
+            )
         )
         report["yw_would_update"] = (
-            not yw_output.exists() or yw_output.read_text(encoding="utf-8-sig") != render(yw_entries)
+            not yw_output.exists()
+            or yw_output.read_text(encoding="utf-8-sig") != render_with_annotations(yw_entries, yw_annotations)
         )
     else:
-        report["updated"] = write_if_changed(args.output, render(valid))
-        report["yw_updated"] = write_if_changed(yw_output, render(yw_entries))
+        if "playlist_blocked" not in report:
+            report["updated"] = write_if_changed(args.output, render(valid))
+        else:
+            report["updated"] = False
+        report["yw_updated"] = write_if_changed(
+            yw_output, render_with_annotations(yw_entries, yw_annotations)
+        )
     return report
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fetch, validate, and publish an IPTV M3U playlist.")
     parser.add_argument("--sources", type=Path, default=DEFAULT_SOURCES)
+    parser.add_argument("--blocked-urls", type=Path, default=DEFAULT_BLOCKED_URLS)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--yw-output", type=Path, default=DEFAULT_YW_OUTPUT)
+    parser.add_argument("--review-output", type=Path, default=DEFAULT_REVIEW_OUTPUT)
     parser.add_argument("--download-timeout", type=int, default=20)
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument("--workers", type=int, default=8)

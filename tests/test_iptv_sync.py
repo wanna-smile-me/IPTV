@@ -37,16 +37,44 @@ https://backup.example/live.m3u8
         self.assertIn("央视一套", entries[0].extinf)
         self.assertEqual(entries[1].url, "https://backup.example/live.m3u8")
 
-    def test_blocked_hosts_are_removed_before_validation(self):
+    def test_only_exact_blocked_urls_are_removed(self):
         entries = MODULE.parse_m3u("""#EXTM3U
 #EXTINF:-1,Blocked
-http://173.208.212.130:8181/live.m3u8
-#EXTINF:-1,Allowed
+http://173.208.212.130:8181/1080p/cctv6.m3u8
+#EXTINF:-1,SameHostAllowed
+http://173.208.212.130:8181/1080p/cctv1.m3u8
+#EXTINF:-1,OtherHost
 http://example.test/live.m3u8
 """)
-        kept, blocked = MODULE.filter_blocked_hosts(entries, {"173.208.212.130"})
+        kept, blocked = MODULE.filter_blocked_urls(
+            entries, {"http://173.208.212.130:8181/1080p/cctv6.m3u8"}
+        )
         self.assertEqual(blocked, 1)
-        self.assertEqual([entry.extinf.split(",", 1)[1] for entry in kept], ["Allowed"])
+        self.assertEqual(
+            [entry.extinf.split(",", 1)[1] for entry in kept],
+            ["SameHostAllowed", "OtherHost"],
+        )
+
+    def test_cctv_fallback_keeps_channels_when_validation_fails(self):
+        candidates = [
+            MODULE.Entry(
+                f'#EXTINF:-1 group-title="央视",CCTV-{number}',
+                f"https://example.test/cctv{number}.m3u8",
+            )
+            for number in range(1, 16)
+        ]
+        entries, annotations, missing = MODULE.build_yw_entries(
+            valid=[],
+            candidates=candidates,
+            previous=[],
+            blocked_urls=set(),
+        )
+        self.assertEqual(missing, [])
+        self.assertEqual(
+            {MODULE.cctv_channel_number(entry) for entry in entries},
+            set(range(1, 16)),
+        )
+        self.assertEqual(len(annotations), 15)
 
     def test_render_removes_quality_suffix_and_keeps_comment_annotation(self):
         entries = [
@@ -204,7 +232,11 @@ https://example.invalid/hunan
             output = Path(directory) / "IPTV.m3u"
             sources = Path(directory) / "sources.txt"
             sources.write_text("https://example.invalid/source\n", encoding="utf-8")
-            old = '#EXTM3U\n#EXTINF:-1,CCTV1\nhttps://example.invalid/a\n#EXTINF:-1,CCTV2\nhttps://example.invalid/b\n'
+            old = "#EXTM3U\n" + "".join(
+                f'#EXTINF:-1 group-title="央视",CCTV-{number}\n'
+                f"https://example.invalid/cctv{number}.m3u8\n"
+                for number in range(1, 16)
+            )
             output.write_text(old, encoding="utf-8")
             args = argparse.Namespace(sources=sources, output=output, download_timeout=1, timeout=1,
                                       yw_output=Path(directory) / "ywIPTV.m3u",
@@ -216,7 +248,7 @@ https://example.invalid/hunan
                 with patch.object(MODULE, "fetch", return_value=old):
                     with patch.object(MODULE, "check_entries", return_value=([], [{"entry": "1", "reason": "timeout"}])):
                         report = MODULE.run(args)
-                        self.assertIn("blocked", report)
+                        self.assertIn("playlist_blocked", report)
                         self.assertEqual(report["valid_entries"], 0)
                     with patch.object(MODULE, "check_entries", side_effect=MODULE.SyncError("validation did not complete")):
                         with self.assertRaises(MODULE.SyncError):
@@ -231,14 +263,18 @@ https://example.invalid/hunan
             output = Path(directory) / "IPTV.m3u"
             sources = Path(directory) / "sources.txt"
             sources.write_text("https://example.invalid/a\nhttps://example.invalid/b\n", encoding="utf-8")
-            text = '#EXTM3U\n#EXTINF:-1,CCTV1\nhttps://example.invalid/live\n'
+            text = "#EXTM3U\n" + "".join(
+                f'#EXTINF:-1 group-title="央视",CCTV-{number}\n'
+                f"https://example.invalid/cctv{number}.m3u8\n"
+                for number in range(1, 16)
+            )
             args = argparse.Namespace(sources=sources, output=output, download_timeout=1, timeout=1,
                                       workers=1, retries=0, dry_run=False)
             with patch.object(MODULE.shutil, "which", return_value="ffmpeg"), \
                  patch.object(MODULE, "fetch", return_value=text), \
                  patch.object(MODULE, "check_entry", return_value=(True, "ok")):
                 report = MODULE.run(args)
-                self.assertEqual(report["duplicate_entries"], 1)
+                self.assertEqual(report["duplicate_entries"], 15)
                 self.assertTrue(report["updated"])
                 self.assertTrue(report["yw_updated"])
                 self.assertTrue((Path(directory) / "ywIPTV.m3u").exists())

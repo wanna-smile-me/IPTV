@@ -1,0 +1,3 @@
+# Temporary quarantine: only these confirmed advertising/disguised stream URLs are blocked.
+http://173.208.212.130:8181/1080p/cctv6.m3u8
+http://74.91.26.218:82/live/cctv6hd.m3u8
